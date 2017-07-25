@@ -1,6 +1,6 @@
 /**
- * @brief  This header file implements a class for calibrating the camera pose
- *         w.r.t a reference marker which is considered as the world cooridnate.
+ * @brief  This header file implements ArucoCalibrator class for calibrating the camera pose
+ *         w.r.t a reference marker coordinate that is considered as the world cooridnate.
  *
  * @author Yiming Wang (wangyimingkaren@gmail.com)
  * @date   20/05/2017
@@ -85,7 +85,7 @@ public:
     int arucoInit ();
 
     /**
-     * @brief write the computed camera pose into files
+     * @brief write the averaged camera pose into files
     */
     bool writeCameraParameters();
 
@@ -318,7 +318,7 @@ int ArucoCalibrator::arucoInit ()
 
     ROS_INFO ("\tSuccessfully read camera parameters");
 
-    // parepare the detector parameters //
+    // parepare the detector parameters
     readOk = aruco_detection::readDetectorParametersVersionWrapper(detectorParams,abs_path_det);
     if(!readOk)
     {
