@@ -1,7 +1,0 @@
-%YAML:1.0
-videoname: "m1"
-saveVideo: 1
-saveData: 1
-targetIDs: [1,2,3]
-markerLength: 130
-
