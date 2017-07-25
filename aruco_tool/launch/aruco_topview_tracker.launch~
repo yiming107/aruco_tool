@@ -1,0 +1,48 @@
+<!--
+  This launch file initializes the kobuki with camera and map it in rviz, and detect the marker . 
+ -->
+
+<launch>
+    <!--Access the camera publish the camera_info and image_row topics-->
+  <node pkg="tracker" type= "trackerOnce" name= "trackerOnce1" output="screen">
+    <param name = 'selfID' type = 'int' value = '1' />
+    <rosparam command="load" file="$(find exp_setup)/param/markerIDs.yaml" />
+    <param name = 'publishFusion' value = 'true' />
+    <param name = 'saveData' value = 'true' />
+    <param name = 'maxFusionIteration' value = '1' />
+    <param name = 'maxNumMessagegsFusion' value = '1' />
+  </node>
+
+  <!-- Node to detect the marker on image plane and estimate the pose -->
+  <node pkg="aruco_tool" type="arucoDetectionTopView" name="arucoDetector" output = 'screen'>
+    <param name = 'selfID' type = 'int' value = '1' />
+    <param name= 'camera_cal_path' type = 'string' value="$(find aruco_tool)/Param/camera3.xml"/>
+    <param name= 'detector_param_path' type = 'string' value="$(find aruco_tool)/Param/detector_params.yml"/>
+    
+    <param name="publish_tf" value="true" />
+    <param name="marker_length" value="160" />
+    <param name="save_data" value="true" />
+    <param name="save_video" value="true" />
+    <param name="track_point" value="true" />
+    <param name="visualize_image" value="true" />
+    <param name="saved_video_name" value="test" />
+    <param name="image_width" value="640" />
+    <param name="image_height" value="480" />
+    <rosparam command="load" file="$(find exp_setup)/param/markerIDs.yaml" />
+  </node>
+
+  <!--Access the camera publish the camera_info and image_row topics-->
+  <node pkg="cv_camera" type="cv_camera_node_sync" name="camera1">
+    <param name="frame_id" value="camera1" />
+    <param name="device_id" value= "1" />
+    <param name="camera_info_url" value="$(find aruco_tool)/Param/camera3.xml"/>
+    <param name="rate" value="10.0" />
+    <param name="image_width" value="640" />
+    <param name="image_height" value="480" />
+  </node>
+
+  <node pkg="tracker" type="synchronizer" name= "synchronizer" >
+     <param name="frequency" value="10.0" />
+  </node>
+
+</launch>

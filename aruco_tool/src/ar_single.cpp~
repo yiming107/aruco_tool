@@ -1,0 +1,1037 @@
+/*
+ *  Single Marker Pose Estimation using ARUCO marker
+ *  Yiming Wang <yiming.wang@qmul.ac.uk>
+ *
+ *  This program is free software: you can redistribute it and/or modify
+ *  it under the terms of the GNU General Public License as published by
+ *  the Free Software Foundation, either version 3 of the License, or
+ *  (at your option) any later version.
+ *
+ *  This program is distributed in the hope that it will be useful,
+ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *  GNU General Public License for more details.
+ *
+ *  You should have received a copy of the GNU General Public License
+ *  along with this program. If not, see <http://www.gnu.org/licenses/>.
+ */
+
+#include "ar_pose/ar_single.h"
+#include "ar_pose/file_util.h"
+#include "ar_pose/lk_util.h"
+
+int main (int argc, char **argv)
+{
+    ros::init (argc, argv, "ar_single");
+    ros::NodeHandle n;
+
+    ar_pose::ARSinglePublisher arSingle(n);
+    ros::spin();
+    return 0;
+}
+
+/// This is to make the print out work
+namespace patch
+{
+template < typename T > std::string to_string( const T& n )
+{
+    std::ostringstream stm ;
+    stm << n ;
+    return stm.str() ;
+}
+}
+
+
+namespace ar_pose
+{
+
+//// Constructor
+ARSinglePublisher::ARSinglePublisher (ros::NodeHandle & n):n_ (n), it_ (n_)
+{
+    std::string local_path,package_path;
+    package_path = ros::package::getPath (ROS_PACKAGE_NAME);
+
+    std::cout<<"Test::package_path"<<package_path<<std::endl;
+
+
+    cont_failure_count = 0;// initialize the continuous failure count to 0;
+    successfulDetection_ = false;
+
+    std::string default_path = "data/patt.hiro";
+
+    ros::NodeHandle n_param ("~");
+    XmlRpc::XmlRpcValue xml_marker_center;
+
+    ROS_INFO("Starting ArSinglePublisher");
+
+    // **** get parameters
+
+    if (!n_param.getParam("publish_tf", publishTf_))
+        publishTf_ = true;
+    ROS_INFO ("\tPublish transforms: %d", publishTf_);
+
+    if (!n_param.getParam("threshold", threshold_))
+        threshold_ = 100;
+    ROS_INFO ("\tThreshold: %d", threshold_);
+
+    if (!n_param.getParam("marker_width", markerWidth_))
+        markerWidth_ = 80.0;
+    ROS_INFO ("\tMarker Width: %.1f", markerWidth_);
+
+    if (!n_param.getParam("reverse_transform", reverse_transform_))
+        reverse_transform_ = false;
+    ROS_INFO("\tReverse Transform: %d", reverse_transform_);
+
+    if (!n_param.getParam("marker_frame", markerFrame_))
+        markerFrame_ = "ar_marker";
+    ROS_INFO ("\tMarker frame: %s", markerFrame_.c_str());
+
+    //---- Yiming added
+    if (!n_param.getParam("usePreProcessing", preProcessing_))
+        preProcessing_ = false;
+    ROS_INFO ("\tUse Preprocessing: %d", preProcessing_);
+
+    //---- Yiming added
+    if (!n_param.getParam("filterMarker", markerFileter_))
+        markerFileter_ = false;
+    ROS_INFO ("\t Filter Marker: %d", markerFileter_);
+
+    if (!n_param.getParam("setROI", setROI_))
+        setROI_= false;
+    ROS_INFO ("\t Set ROI: %d", setROI_);
+
+    if (!n_param.getParam("showRawDetections", showRawDetections_))
+        setROI_= false;
+    ROS_INFO ("\t Set showRawDetections: %d", showRawDetections_);
+
+
+
+    if (!n_param.getParam("adaptiveConstraint", adaptiveConstraints_))
+        adaptiveConstraints_= false;
+    ROS_INFO ("\t Set adaptive consecutive constraint: %d", adaptiveConstraints_);
+
+    // If mode=0, we use arGetTransMat instead of arGetTransMatCont
+    // The arGetTransMatCont function uses information from the previous image
+    // frame to reduce the jittering of the marker
+    if (!n_param.getParam("use_history", useHistory_))
+        useHistory_ = true;
+    ROS_INFO("\tUse history: %d", useHistory_);
+
+    if (!n_param.getParam("save_data", saveData_))
+        saveData_ = true;
+    ROS_INFO("\tSave data: %d", saveData_);
+
+    if (!n_param.getParam("track_points", trackPoints_))
+        trackPoints_ = true;
+    ROS_INFO("\tTrack points: %d", trackPoints_);
+
+//     n_param.param ("marker_pattern", local_path, std::string ("data/patt.hiro"));
+//     sprintf (pattern_filename_, "%s/%s", package_path.c_str (), local_path.c_str ());
+//     ROS_INFO ("\tMarker Pattern Filename: %s", pattern_filename_);
+
+    //modifications to allow patterns to be loaded from outside the package
+    n_param.param ("marker_pattern", local_path, default_path);
+    if (local_path.compare(0,5,"data/") == 0)
+    {
+        //to keep working on previous implementations, check if first 5 chars equal "data/"
+        sprintf (pattern_filename_, "%s/%s", package_path.c_str (), local_path.c_str ());
+    }
+    else
+    {
+        //for new implementations, can pass a path outside the package_path
+        sprintf (pattern_filename_, "%s", local_path.c_str ());
+    }
+    // read the temp_folder_path
+
+    n_param.getParam("temp_folder", temp_path_);
+
+    n_param.param ("marker_center_x", marker_center_[0], 0.0);
+    n_param.param ("marker_center_y", marker_center_[1], 0.0);
+
+    ROS_INFO ("\tMarker Center: (%.1f,%.1f)", marker_center_[0], marker_center_[1]);
+
+    // **** subscribe
+
+    ROS_INFO ("Subscribing to info topic");
+    sub_ = n_.subscribe (cameraInfoTopic_, 1, &ARSinglePublisher::camInfoCallback, this);
+    getCamInfo_ = false;
+    getFisrtMarkerWindow_ = false;
+
+    // **** advertsie
+    arMarkerPub_   = n_.advertise<ar_pose::ARMarker>("ar_pose_marker", 0);
+    arMarkerPointPub_ = n_.advertise<ar_pose::ARMarkerPoint>("ar_marker_points", 0); // Yiming added
+}
+
+//// Destructor
+ARSinglePublisher::~ARSinglePublisher (void)
+{
+    //cvReleaseImage(&capture); //Don't know why but crash when release the image
+    arVideoCapStop ();
+    arVideoClose ();
+}
+
+
+
+//// Call back function to read camera calibration info from the topic
+void ARSinglePublisher::camInfoCallback (const sensor_msgs::CameraInfoConstPtr & cam_info)
+{
+    if (!getCamInfo_)
+    {
+        std::cout<<"I am reading the camera information...\n";
+        cam_info_ = (*cam_info);
+
+        cam_param_.xsize = cam_info_.width;
+        cam_param_.ysize = cam_info_.height;
+        cam_param_.mat[0][0] = cam_info_.P[0];
+        cam_param_.mat[1][0] = cam_info_.P[4];
+        cam_param_.mat[2][0] = cam_info_.P[8];
+        cam_param_.mat[0][1] = cam_info_.P[1];
+        cam_param_.mat[1][1] = cam_info_.P[5];
+        cam_param_.mat[2][1] = cam_info_.P[9];
+        cam_param_.mat[0][2] = cam_info_.P[2];
+        cam_param_.mat[1][2] = cam_info_.P[6];
+        cam_param_.mat[2][2] = cam_info_.P[10];
+        cam_param_.mat[0][3] = cam_info_.P[3];
+        cam_param_.mat[1][3] = cam_info_.P[7];
+        cam_param_.mat[2][3] = cam_info_.P[11];
+
+        cam_param_.dist_factor[0] = cam_info_.K[2];       // x0 = cX from openCV calibration
+        cam_param_.dist_factor[1] = cam_info_.K[5];       // y0 = cY from openCV calibration
+        if ( cam_info_.distortion_model == "plumb_bob" && cam_info_.D.size() == 5)
+            cam_param_.dist_factor[2] = -100*cam_info_.D[0];// f = -100*k1 from CV. Note, we had to do mm^2 to m^2, hence 10^8->10^2
+        else
+            cam_param_.dist_factor[2] = 0;                  // We don't know the right value, so ignore it
+
+        cam_param_.dist_factor[3] = 1.0;                  // scale factor, should probably be >1, but who cares...
+
+        // get prepared for capturing frames
+        arInit();
+
+        ROS_INFO ("Subscribing to image topic");
+        cam_sub_ = it_.subscribe (cameraImageTopic_, 1, &ARSinglePublisher::getTransformationCallback, this);
+        imageMarkerPub_ = it_.advertise("/ar_marker_image", 1);
+
+        getCamInfo_ = true;
+    }
+}
+
+//// Function to get prepared for capturing frames
+void ARSinglePublisher::arInit ()
+{
+
+    // load camera information
+    arInitCparam (&cam_param_);
+
+    ROS_INFO ("*** Camera Parameter ***");
+    arParamDisp (&cam_param_);
+
+    // load pattern file
+
+    ROS_INFO ("Loading pattern");
+    patt_id_ = arLoadPatt (pattern_filename_);
+    if (patt_id_ < 0)
+    {
+        ROS_ERROR ("Pattern file load error: %s", pattern_filename_);
+        ROS_BREAK ();
+    }
+
+}
+
+void ARSinglePublisher::preprocessImage(cv_bridge::CvImagePtr & capture_preprocess_)
+{
+    std::cout<<"I am preprocessing the image..."<<std::endl;
+    //cv::Mat(const IplImage* img, bool copyData=false);
+} // end of the function
+
+
+void ARSinglePublisher::setImageROI(cv_bridge::CvImagePtr & capture_preprocess_, cv::Rect roi, cv::Mat & imageROI)
+{
+    std::cout<<"...I am setting the ROI for detection"<<std::endl;
+
+    cv::Mat imageMat = capture_preprocess_->image;
+
+    cv::Scalar color(255,255,255);
+
+    // create a all white image
+    cv::Mat allWhite(image_height,image_width,CV_8UC3, color);
+
+    //Create the cv::Mat with the ROI you need, where "image" is the cv::Mat you want to extract the ROI from
+    imageROI = imageMat(roi);
+
+    imageROI.copyTo(allWhite(roi));
+
+    imageMat = allWhite;
+
+    capture_preprocess_->image = imageMat; // so the threshold should be low, try 80
+
+    std::cout<<"I finished setting the ROI for detection..."<<std::endl;
+
+}
+
+bool ARSinglePublisher::checkConsecutiveDetection(cv::Rect previousRect, cv::Rect currentRect, double threshValue[])
+{
+
+    bool x_, y_, width_, height_;
+// x satisfied
+
+///////////////////// Set the  Threshold here!!!!
+    double threshold_x = threshValue[0], threshold_y = threshValue[1], threshold_width = threshValue[2], threshold_height = threshValue[3];
+
+    int p_center_x = previousRect.x+0.5*previousRect.width;
+    int center_x = currentRect.x+0.5*currentRect.width;
+
+    int p_center_y = previousRect.y+0.5*previousRect.height;
+    int center_y = currentRect.y+0.5*currentRect.height;
+
+    x_ = double(std::abs(p_center_x - center_x)) < threshold_x;
+// y satisfied
+    y_ = double(std::abs(p_center_y - center_y))< threshold_y;
+
+// rows satisfied
+    width_ = double(std::abs(previousRect.width - currentRect.width))< threshold_width;
+
+// height satisfied
+    height_ = double(std::abs(previousRect.height - currentRect.height)) < threshold_height;
+
+    //
+
+    float squareRatio = std::abs(float(currentRect.width)/float(currentRect.height)-1);
+
+    std::cout<<"Constraints condition::"<< x_ <<","<< y_ <<","<<width_<<","<<height_<<std::endl;
+    return x_ && y_ && width_ && height_;
+
+}
+
+void ARSinglePublisher::setConstriants(cv::Rect pprev_MarkerRect, cv::Rect prev_MarkerRect, int cont_failure, double (&threshold)[4])
+{
+    int pp_center_x = pprev_MarkerRect.x + int (0.5*pprev_MarkerRect.width);
+    int pp_center_y = pprev_MarkerRect.y + int (0.5*pprev_MarkerRect.height);
+
+    int p_center_x = prev_MarkerRect.x + int (0.5*prev_MarkerRect.width);
+    int p_center_y = prev_MarkerRect.y + int (0.5*prev_MarkerRect.height);
+
+    int center_displace_x = std::abs(p_center_x - pp_center_x);
+    int center_displace_y = std::abs(p_center_x - pp_center_x);
+
+    int width_displace = std::abs(prev_MarkerRect.width - pprev_MarkerRect.width);
+    int height_displace = std::abs(prev_MarkerRect.height - pprev_MarkerRect.height);
+
+    if (center_displace_x<10)
+        center_displace_x= 10;
+
+    if (center_displace_y<10)
+        center_displace_y = 10;
+
+    if (width_displace<10)
+        width_displace= 10;
+
+    if (height_displace<10)
+        height_displace = 10;
+
+    threshold[0] = double((cont_failure+1)*center_displace_x+50);
+    threshold[1] = double((cont_failure+1)*center_displace_y+50);
+    threshold[2] = double((cont_failure+1)*width_displace+50);
+    threshold[3] = double((cont_failure+1)*height_displace+50);
+
+    std::cout<<"Previous displacement values::"<<center_displace_x<<","<<center_displace_y<<","<<width_displace<<","<<height_displace<<std::endl;
+    std::cout<<"Threshold values::"<<threshold[0]<<","<<threshold[1]<<","<<threshold[2]<<","<<threshold[3]<<std::endl;
+
+}
+
+
+
+cv::Rect ARSinglePublisher::changeRectShape(cv::Rect oldRect, float r[], const int &image_height, const int &image_width)
+{
+    // prepare the ROI area
+
+    int center_x = oldRect.x + int (0.5*oldRect.width);
+    int center_y = oldRect.y + int (0.5*oldRect.height);
+
+    int ideal_window_width = int (oldRect.width*r[0]);
+
+    int ideal_window_height = int (oldRect.height*r[1]);
+
+    int window_x = std::max((center_x - int (0.5*ideal_window_width)),0);
+
+    int window_y = std::max((center_y - int (0.5*ideal_window_height)),0);
+
+    int window_width = std::min(image_width-1- window_x,ideal_window_width);
+    int window_height = std::min(image_height-1- window_y,ideal_window_height);
+
+    cv::Rect newRect(window_x, window_y, window_width, window_height); // set the ROI fixed when camshift is not used
+
+    return newRect;
+}
+
+void ARSinglePublisher::setROIRatio(cv::Rect pprev_MarkerRect, cv::Rect prev_MarkerRect, float (&ratio4ROI)[2])
+{
+    int pp_center_x = pprev_MarkerRect.x + int (0.5*pprev_MarkerRect.width);
+    int pp_center_y = pprev_MarkerRect.y + int (0.5*pprev_MarkerRect.height);
+
+    int p_center_x = prev_MarkerRect.x + int (0.5*prev_MarkerRect.width);
+    int p_center_y = prev_MarkerRect.y + int (0.5*prev_MarkerRect.height);
+
+
+    if (prev_MarkerRect.width!=0)
+    {
+        float displacement_ratio_x = float (std::abs(p_center_x-pp_center_x))/float (prev_MarkerRect.width);
+        float size_ratio_x = float (std::max((prev_MarkerRect.width - pprev_MarkerRect.width),0))/float (prev_MarkerRect.width);
+
+        ratio4ROI[0]  = 1.5+ 5*displacement_ratio_x + 5*size_ratio_x ;
+
+        std::cout<<"width ratio to enlarge>>>>>>>"<<displacement_ratio_x<<" and "<<size_ratio_x<<std::endl;
+    }
+    else
+    {
+        ratio4ROI[0] = 2;
+    }
+
+
+    if (prev_MarkerRect.height!=0)
+    {
+
+        float displacement_ratio_y = float (std::abs(p_center_y-pp_center_y))/float (prev_MarkerRect.height);
+        float size_ratio_y = float (std::max((prev_MarkerRect.height - pprev_MarkerRect.height),0))/prev_MarkerRect.height;
+
+        ratio4ROI[1] = 1.5 + 5*displacement_ratio_y + 5*size_ratio_y;
+
+        std::cout<<"height ratio to enlarge>>>>>>>"<<displacement_ratio_y<<" and "<<size_ratio_y<<std::endl;
+    }
+    else
+    {
+        ratio4ROI[1] = 2;
+    }
+
+
+
+}
+
+
+//// call back function when receive a image message
+void ARSinglePublisher::getTransformationCallback (const sensor_msgs::ImageConstPtr & image_msg)
+{
+    ARUint8 *dataPtr;
+    ARMarkerInfo *marker_info;
+    int marker_num;
+    int i, k;
+
+
+    /* Get the image from ROSTOPIC
+     * NOTE: the dataPtr format is BGR because the ARToolKit library was
+     * build with V4L, dataPtr format change according to the
+     * ARToolKit configure option (see config.h).*/
+
+    try
+    {
+        capture_ = cv_bridge::toCvCopy (image_msg, sensor_msgs::image_encodings::BGR8);
+
+        capture4show_ = cv_bridge::toCvCopy (image_msg, sensor_msgs::image_encodings::BGR8);
+        // capture_preprocess_ only provide image for detector
+        capture_preprocess_ = cv_bridge::toCvCopy (image_msg, sensor_msgs::image_encodings::BGR8);
+
+        // CvImage.image is of type cv::Mat
+        frameMat = capture_preprocess_->image;
+        image_height = frameMat.rows; // 600
+        image_width = frameMat.cols; // 800
+
+        cv::cvtColor(frameMat, gray, cv::COLOR_BGR2GRAY);
+
+        if(!getFisrtMarkerWindow_)
+        {
+            gray.copyTo(prevGray);
+        }
+
+
+
+
+    }
+    catch (cv_bridge::Exception& e)
+    {
+        ROS_ERROR("cv_bridge exception: %s", e.what());
+    }
+
+
+    if (preProcessing_)
+    {
+        preprocessImage(capture_preprocess_);   // Add constraints and white balancing
+    }
+
+
+
+    /** This is the section related to setting ROI **/
+
+    if (!getFisrtMarkerWindow_)
+    {
+        std::cout<<"Not initialized yet..."<<std::endl;
+        // there is no first window
+        // _Tp _x, _Tp _y, _Tp _cols, _Tp _rows
+
+        if (setROI_)
+        {
+            cv::Rect roi(200, 150, 400, 300); // set the ROI fixed when camshift is not used
+            setImageROI(capture_preprocess_, roi, imageROI);
+            cv::Scalar roi_color(0,255,0);
+            cv::rectangle(capture4show_->image,roi, roi_color,2);
+        }
+
+    }
+    else
+    {
+        std::cout<<"Initialized ... "<<std::endl;
+
+        // prepare the ROI area
+        if (setROI_)
+        {
+
+
+            setROIRatio(pPreviousMarkerRect, previousMarkerRect, ratio4ROI);
+
+            // increase the size based on the continuos missing detection
+            if (adaptiveConstraints_)
+            {
+
+
+                for (int i=0; i<2; i++)
+                {
+                    float temp = ratio4ROI[i] + float(cont_failure_count)/float(5);
+                    if (temp>(ratio4ROI[i]+2))
+                    {
+                        temp = ratio4ROI[i]+2;
+                    }
+                    ratio4ROI[i] = temp;
+                }
+            }
+
+            cv::Rect roi = changeRectShape(previousMarkerRect, ratio4ROI, image_height, image_width);
+            setImageROI(capture_preprocess_, roi, imageROI);
+            cv::Scalar roi_color(0,255,0);
+            cv::rectangle(capture4show_->image,roi, roi_color,2);
+        }
+
+    }
+    /////////////////////////////////////////////////////////////////////////////////
+
+
+    /** Detect marker **/
+    dataPtr = (ARUint8 *) ((IplImage) capture_preprocess_->image).imageData;
+
+    // detect the markers in the video frame
+    if (arDetectMarker (dataPtr, threshold_, &marker_info, &marker_num) < 0)
+    {
+        ROS_FATAL ("arDetectMarker failed");
+        ROS_BREAK ();             // FIXME: I don't think this should be fatal... -Bill
+    }
+
+    // check for known patterns
+    k = -1;
+
+    for (i = 0; i < marker_num; i++)
+    {
+        if (showRawDetections_)
+        {
+
+            std::vector<cv::Point> tempContour;
+
+            for (int j = 0; j < 4; j++)
+            {
+                tempContour.push_back(cv::Point2i((int)marker_info[i].vertex[j][0], (int)marker_info[i].vertex[j][1]));
+            }
+
+            std::vector<std::vector<cv::Point> > tempContourVec;
+            tempContourVec.push_back(tempContour);
+
+            cv::Scalar color(255,0,0);
+
+            std::ostringstream str;
+            str << "[" <<marker_info[i].id<<", "<<marker_info[i].cf<<"]"<<patt_id_;
+
+            cv::drawContours(capture4show_->image,tempContourVec,0,color,2,8);
+            cv::putText(capture4show_->image, str.str(),cv::Point2i((int)marker_info[i].vertex[1][0], (int)marker_info[i].vertex[1][1]+10), CV_FONT_HERSHEY_PLAIN, 1,cv::Scalar(0,0,0));
+        }
+
+
+        if (marker_info[i].id == patt_id_)// if the id is correct 0, otherwise -1
+        {
+            ROS_DEBUG ("Found pattern: %d ", patt_id_);
+
+            // make sure you have the best pattern (highest confidence factor)
+            if (k == -1) // make k start with 0
+                k = i;
+            else if (marker_info[k].cf < marker_info[i].cf)
+                k = i;
+
+        }
+    } // end for loop for checking each detection
+
+
+    /**Check the marker detection**/
+
+    if (k != -1)
+    {
+        // If do have a detection
+
+        if (!getFisrtMarkerWindow_)
+        {
+            /// check the size first if it is OK
+
+            // get the bounding box first from the corners
+            markerContour.clear();
+            for (int i = 0; i < 4; i++)
+            {
+                markerContour.push_back(cv::Point2i((int) marker_info[k].vertex[i][0], (int) marker_info[k].vertex[i][1]));
+            }
+
+            cv::Rect bRect = cv::boundingRect(markerContour);
+            // calculate the area
+
+            bool confidenceConstraint_ = marker_info[k].cf>0.85;
+
+            if (confidenceConstraint_)
+            {
+
+                std::cout<< "I detetcted the qualified detection ..."<<std::endl;
+                //
+
+
+                pPreviousMarkerRect = bRect;
+
+                previousMarkerRect = bRect;
+
+                currentMarkerRect = bRect;
+                // set the window
+                // prepare the ROI area
+
+                cv::Mat initialSelection = frameMat(bRect);
+
+                if (saveData_)
+                {
+
+                    //***set the file name
+                    std::stringstream ss;
+                    ss<<temp_path_<<"iniSelection";
+                    std::string validateFileName = fileUtil::checkFileName(ss.str(),".jpg");
+
+                    cv::imwrite(validateFileName,initialSelection);
+
+
+
+                    // initialize the file name for marker detection location
+                    std::stringstream ss1;
+                    ss1<<temp_path_<<"detectionLoc";
+                    validateLocFileName = fileUtil::checkFileName(ss1.str(),".txt");
+                }
+
+                if (trackPoints_)
+                {
+                    // track points here
+                    float r[2] = {1.2,1.2};
+                    cv::Rect roi = changeRectShape(bRect, r, image_height, image_width);
+                    LucasKanade::LK_tracking_ini(gray, prevGray, roi, points,motionVec);
+                }
+
+                // set the bool to true
+                getFisrtMarkerWindow_ = true;
+            }
+            else
+            {
+                std::cout<< "I failed to detect the qualified target ROI, Try next frame..."<<std::endl;
+                getFisrtMarkerWindow_ = false;
+                successfulDetection_ = false;
+            }
+
+        }
+        else   // if already got the first detection, then assign the previous marker detection and update the current marker
+        {
+            // get the bounding box first from the corners
+            markerContour.clear();
+            for (int i = 0; i < 4; i++)
+            {
+                markerContour.push_back(cv::Point2i((int) marker_info[k].vertex[i][0], (int) marker_info[k].vertex[i][1]));
+            }
+
+            cv::Rect bRect = cv::boundingRect(markerContour);
+
+            currentMarkerRect = bRect;
+        }
+
+        // continue ONLY IF getFisrtMarkerWindow_ is true
+
+        if (getFisrtMarkerWindow_)
+        {
+
+            // the temporal filtering applyies oonly when the there already a failure_count
+            if (markerFileter_&&(cont_failure_count>0))
+            {
+                if (adaptiveConstraints_)
+                {
+                    setConstriants(pPreviousMarkerRect, previousMarkerRect, cont_failure_count, thresholdValues);
+                }
+                else
+                {
+
+                    for (int i=0; i<4; i++)
+                    {
+                        thresholdValues[i] = 50;
+                    }
+
+                }
+
+                // else will be the default value
+
+                // can adapt it based on the threshold value
+                consecutiveConstraint_ = checkConsecutiveDetection(previousMarkerRect, currentMarkerRect,thresholdValues);
+
+            }
+            else
+            {
+                consecutiveConstraint_ = true;
+            }
+
+
+            // Check if the detection is sqaure enough
+            double marker_area = cv::contourArea(markerContour);
+
+            double bounding_area = double (currentMarkerRect.width*currentMarkerRect.height);
+            float area_ratio  = float(marker_area)/float(bounding_area);
+
+            if ((area_ratio>0.4)&&(marker_area>400)) // often the right coonstraints is larger than 0.8
+            {
+                squareConstraint_ = true;
+            }
+            else
+            {
+                squareConstraint_ = false;
+            }
+
+            // display debug information on the image
+            if (!squareConstraint_)
+            {
+                cv::putText(capture4show_->image, "Square constraints not satisfied!!",cv::Point2i(100,100), CV_FONT_HERSHEY_PLAIN, 1,cv::Scalar(0,0,0));
+            }
+
+
+            if (!consecutiveConstraint_)
+            {
+                cv::putText(capture4show_->image, "Consecutive constraints not satisfied!!",cv::Point2i(100,200), CV_FONT_HERSHEY_PLAIN, 1,cv::Scalar(0,0,255));
+            }
+
+            //if consecutiveConstraint_ = true;
+            if ((consecutiveConstraint_&&squareConstraint_)||(marker_info[k].cf>0.9))
+            {
+                successfulDetection_ = true;
+                cont_failure_count = 0; // reset to 0
+                // Only assigned when it is successful!
+                pPreviousMarkerRect = previousMarkerRect;
+                previousMarkerRect = currentMarkerRect;
+
+                if (saveData_)
+                {
+                    // write to the file
+                    std::string str2write = patch::to_string(currentMarkerRect.x+int(0.5*(currentMarkerRect.width-image_width)))+" "+patch::to_string(currentMarkerRect.y+int(0.5*(currentMarkerRect.height-image_height)))+" "+patch::to_string(currentMarkerRect.width)+" "+patch::to_string(currentMarkerRect.height);
+
+                    fileUtil::write2file(validateLocFileName.c_str(), str2write);
+                }
+
+                // **** Yiming added: broadcast the marker point location
+
+                // **** Yiming added: draw the marker on the image
+
+                std::vector<std::vector<cv::Point> > contourVec;
+                contourVec.push_back(markerContour);
+
+                cv::Scalar color(0,0,255);
+
+                cv::drawContours(capture4show_->image,contourVec,0,color,2,8);
+
+            }// if constraint satisfied
+            else
+            {
+                successfulDetection_ = false;
+                std::cout<<"The constraints are not satisfied ..."<<std::endl;
+
+
+                cont_failure_count = cont_failure_count+1;
+            }
+
+        }
+        else
+        {
+            // no window initialized
+            successfulDetection_ = false;
+            std::cout<<"Window not initilized yet...\n";
+
+        } // end if has the window
+    } // end of having a detection
+    else // if do not have a detection
+    {
+        successfulDetection_ = false;
+        if (getFisrtMarkerWindow_)
+        {
+
+            cont_failure_count = cont_failure_count+1;
+        }
+        std::cout<<"I failed to locate a marker...\n";
+        hasPreviousFrame_ = false;
+        ROS_DEBUG ("Failed to locate marker");
+    }
+
+    ////////////////////////////////////////////////////////////////////////
+    /** Re-initialize the good points when the detection is successful with score over 0.9 **/
+    if (trackPoints_)
+    {
+        if (successfulDetection_&&(marker_info[k].cf>0.9))
+        {
+            // track points here
+            std::cout<<"I am initilizing points again..................................\n"<<std::endl;
+            float r[2] = {1.2,1.2};
+            cv::Rect roi = changeRectShape(currentMarkerRect, r, image_height, image_width);
+            points[0].clear();
+            points[1].clear();
+            LucasKanade::LK_tracking_ini(gray, prevGray, roi, points,motionVec);
+            vector_variance = LucasKanade::LK_motion_correlation(motionVec);
+        }
+        else
+        {
+            /////////////////////////////////////////////////////////////////////////////////
+            /**KL points tracking**/
+            std::cout<<"I am tracking points..................................\n"<<std::endl;
+            if (getFisrtMarkerWindow_)
+            {
+                // track points here
+                LucasKanade::LK_tracking(gray, prevGray, points, motionVec);
+                vector_variance = LucasKanade::LK_motion_correlation(motionVec);
+            }
+
+        }
+
+        bool possibile_occlusion = vector_variance>150;
+
+        if (possibile_occlusion){
+
+
+        points[1].clear(); // has to be stay
+        points[0].clear();
+        std::stringstream ss3;
+        ss3<<"Cleaning points due to possible occlusion/mistracking points:"<<vector_variance;
+        cv::putText(capture4show_->image, ss3.str(),cv::Point2f(200,200), CV_FONT_HERSHEY_PLAIN, 1,cv::Scalar(0,255,255));
+
+        }else if ((!successfulDetection_)&&getFisrtMarkerWindow_&&(vector_variance!=-1)){
+
+          cv::putText(capture4show_->image, "Possible detection",cv::Point2f(300,200), CV_FONT_HERSHEY_PLAIN, 1,cv::Scalar(0,255,0));
+
+          /********Set the feature points as the marker detection**********/
+
+        }
+    }
+
+    /////////////////////////////////////////////////////////////////////////
+
+
+
+    /** pubulish marker topics when the detection is successful**/
+    if (successfulDetection_)
+    {
+        // **** get the transformation between the marker and the real camera
+        double arQuat[4], arPos[3];
+
+        if (!useHistory_ || hasPreviousFrame_ )
+            arGetTransMat (&marker_info[k], marker_center_, markerWidth_, marker_trans_);
+        else
+            arGetTransMatCont (&marker_info[k], marker_trans_, marker_center_, markerWidth_, marker_trans_);
+
+        hasPreviousFrame_ = true; // like a indicator shows that there is a previous frame
+
+        arUtilMat2QuatPos (marker_trans_, arQuat, arPos);
+
+        // **** convert to ROS frame
+        double quat0[4], pos0[3], quat[4], pos[3];
+
+
+        //AR_TO_ROS is 0.001
+
+        // **** Yiming: the original one
+        pos0[0] = arPos[0] * AR_TO_ROS;
+        pos0[1] = arPos[1] * AR_TO_ROS;
+        pos0[2] = arPos[2] * AR_TO_ROS;
+
+        quat0[0] = -arQuat[0];
+        quat0[1] = -arQuat[1];
+        quat0[2] = -arQuat[2];
+        quat0[3] = arQuat[3];
+
+        // **** Yiming modification here: adapt camera frame to robot frame
+
+        pos[0] = pos0[2];
+        pos[1] = -pos0[0];
+        pos[2] = -pos0[1];
+
+        // **** not verified yet
+        quat[0] = quat0[0];
+        quat[1] = quat0[1];
+        quat[2] = quat0[2];
+        quat[3] = quat0[3];
+
+
+        ROS_DEBUG (" QUAT: Pos x: %3.5f  y: %3.5f  z: %3.5f", pos[0], pos[1], pos[2]);
+        ROS_DEBUG ("     Quat qx: %3.5f qy: %3.5f qz: %3.5f qw: %3.5f", quat[0], quat[1], quat[2], quat[3]);
+
+        // **** publish the marker
+
+        ar_pose_marker_.header.frame_id = image_msg->header.frame_id;
+        ar_pose_marker_.header.stamp    = image_msg->header.stamp;
+        ar_pose_marker_.id              = marker_info[k].id;
+
+        ar_pose_marker_.pose.pose.position.x = pos[0];
+        ar_pose_marker_.pose.pose.position.y = pos[1];
+        ar_pose_marker_.pose.pose.position.z = pos[2];
+
+        ar_pose_marker_.pose.pose.orientation.x = quat[0];
+        ar_pose_marker_.pose.pose.orientation.y = quat[1];
+        ar_pose_marker_.pose.pose.orientation.z = quat[2];
+        ar_pose_marker_.pose.pose.orientation.w = quat[3];
+
+        ar_pose_marker_.confidence = marker_info[k].cf;
+
+        arMarkerPub_.publish(ar_pose_marker_);
+        ROS_DEBUG ("Published ar_single marker");
+
+        // **** Yiming added:
+
+        tf::Quaternion rotation (quat[0], quat[1], quat[2], quat[3]);
+        tf::Vector3 origin (pos[0], pos[1], pos[2]);
+        tf::Transform t (rotation, origin);
+
+
+        if(publishTf_)
+        {
+            if(reverse_transform_)
+            {
+                tf::StampedTransform markerToCam (t.inverse(), image_msg->header.stamp, markerFrame_.c_str(), image_msg->header.frame_id);
+                broadcaster_.sendTransform(markerToCam);
+            }
+            else
+            {
+                tf::StampedTransform camToMarker (t, image_msg->header.stamp, image_msg->header.frame_id, markerFrame_.c_str());
+                broadcaster_.sendTransform(camToMarker);
+            }
+        }
+
+        // **** publish transform between camera and marker
+
+        // **** Yiming added: broadcast the marker point location
+
+        ar_marker_point_.header.frame_id = image_msg->header.frame_id;
+        ar_marker_point_.header.stamp    = image_msg->header.stamp;
+        ar_marker_point_.id              = marker_info[k].id;
+
+
+        for (int i = 0; i < 4; i++)
+        {
+            ar_marker_point_.loc_x[i] = (int) marker_info[k].vertex[i][0];
+            ar_marker_point_.loc_y[i] = (int) marker_info[k].vertex[i][1];
+        }
+
+        arMarkerPointPub_.publish(ar_marker_point_);
+
+    }
+    else // no qualified detection here
+    {
+
+        std::cout<<"\n DEBUG:: There is NOOOO detection ...\n";
+        ar_pose_marker_.header.frame_id = image_msg->header.frame_id;
+        ar_pose_marker_.header.stamp    = image_msg->header.stamp;
+        ar_pose_marker_.id              = 100;
+        std::cout<<"\n DEBUG:: So I set the ID to 100 ...\n";
+
+        ar_pose_marker_.pose.pose.position.x = 0;
+        ar_pose_marker_.pose.pose.position.y = 0;
+        ar_pose_marker_.pose.pose.position.z = 0;
+
+        ar_pose_marker_.pose.pose.orientation.x = 0;
+        ar_pose_marker_.pose.pose.orientation.y = 0;
+        ar_pose_marker_.pose.pose.orientation.z = 0;
+        ar_pose_marker_.pose.pose.orientation.w = 0;
+
+        ar_pose_marker_.confidence = 0;
+
+        arMarkerPub_.publish(ar_pose_marker_);
+        ROS_DEBUG ("Published ar_single marker");
+
+        // **** publish transform between camera and marker
+
+        // **** Yiming added: broadcast the marker point location
+
+        ar_marker_point_.header.frame_id = image_msg->header.frame_id;
+        ar_marker_point_.header.stamp    = image_msg->header.stamp;
+        ar_marker_point_.id              = 100;
+
+
+        for (int i = 0; i < 4; i++)
+        {
+            ar_marker_point_.loc_x[i] = int(0);
+            ar_marker_point_.loc_y[i] = int(0);
+        }
+
+        arMarkerPointPub_.publish(ar_marker_point_);
+
+    }
+
+
+    // no matter what, the image will still be published
+    std::cout<<"\n DEBUG:: I am publishing image ...\n";
+    // Yiming added: no matter with/without marker, publish the marker image
+    std::cout<<"continuous count: "<<cont_failure_count<<std::endl;
+
+    std::ostringstream str;
+    str << "Continuous Missing detections:" <<cont_failure_count;
+    cv::Scalar color(0,0,255);
+    cv::putText(capture4show_->image, str.str(),cv::Point(500,100), CV_FONT_HERSHEY_PLAIN, 1,color);
+
+    cv::Scalar pp_color(0,0,50);
+    cv::Scalar p_color(0,0,150);
+
+    cv::rectangle(capture4show_->image,previousMarkerRect, p_color,2);
+    cv::rectangle(capture4show_->image,pPreviousMarkerRect, pp_color,2);
+
+    // show the points being tracked
+    if (trackPoints_&&(!points[0].empty()))
+    {
+
+        // draw each point
+        int  points_num= points[0].size();
+        int  color_gap = int(255/points_num);
+
+        for (int i = 0; i < points_num; i++ )
+        {
+            cv::circle(capture4show_->image, points[0][i],3, cv::Scalar(0,color_gap*i,255),2);
+
+            cv::Point2f startPoint(points[0][i].x-motionVec[0][i],points[0][i].y-motionVec[1][i] );
+
+            cv::line(capture4show_->image, startPoint, points[0][i], cv::Scalar(0,color_gap*i,255),2);
+        }
+        // draw bounding box
+        cv::Rect LK_rect;
+        LucasKanade::LK_bounding( points[0],LK_rect);
+
+
+        std::ostringstream str;
+        str << "vector variance::" <<vector_variance;
+
+        cv::putText(capture4show_->image, str.str(),cv::Point2f(LK_rect.x,LK_rect.y-20), CV_FONT_HERSHEY_PLAIN, 1,cv::Scalar(0,0,0));
+        cv::rectangle(capture4show_->image,LK_rect, cv::Scalar(0,255,255),2);
+
+    }
+
+    imageMarkerPub_.publish(capture4show_->toImageMsg());
+
+} // end of the function
+
+
+// Function to get prepared for capturing frames
+// Input: pass by reference (address), so the value will be changed
+
+}                               // end namespace ar_pose
+
+
+
+

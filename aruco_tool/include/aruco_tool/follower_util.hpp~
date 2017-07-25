@@ -1,0 +1,20 @@
+#ifndef FOLLOWER_UTIL_HPP_INCLUDED
+#define FOLLOWER_UTIL_HPP_INCLUDED
+
+// create a class for a robot follower, each robot has its owen follower controller
+
+
+
+// listen to ar marker pose hear for self, target ID, neighbour ID
+
+// hear for it self self ID and be aware of other ID as well
+
+
+// each ID has a object update location with Kalman tracking and keep tracks (another class called LocationTracker)
+
+// controller(self, target loc, neighbors loc) 
+// Inside the controller, different functions can provide different types of controller, feedback, stable feedback,
+
+
+
+#endif // FOLLOWER_UTIL_HPP_INCLUDED
